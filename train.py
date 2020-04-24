@@ -187,17 +187,17 @@ def train(optimizer='LAMB',
 
         ## Train
         callbacks = [] if callback is None else [callback]
-        callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(monitor='val_auc', factor=0.31,
-                                                              patience=2, cooldown=1,
-                                                              verbose=1, mode='max', min_delta=1e-4))
+        callbacks.append(tf.keras.callbacks.EarlyStopping(monitor='val_auc', min_delta=1e-4, mode='max',
+                                                          patience=6, verbose=1, restore_best_weights=True))
 
         if one_cycle:
             callbacks.append(OneCycleScheduler(lr_max=lr, steps=steps_per_epoch*epochs,
                                                mom_min=0.85, mom_max=0.95, phase_1_pct=warm_up/epochs,
                                                div_factor=100, final_div_factor=250))
         else:
-            callbacks.append(tf.keras.callbacks.EarlyStopping(monitor='val_auc', min_delta=1e-4, mode='max',
-                                                              patience=6, verbose=1, restore_best_weights=True))
+            callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(monitor='val_auc', factor=0.31,
+                                                                  patience=2, cooldown=1,
+                                                                  verbose=1, mode='max', min_delta=1e-4))
 
 
         checkpoint_path = f"{gcs_path}/best_model.tf"
@@ -220,7 +220,7 @@ def train(optimizer='LAMB',
     #         print(ex)
     #         history = model.history
 
-        ## Eval and sub
+        ## Eval
         fig, axs = plt.subplots(1, 3, figsize=(18,4))
         # Plot training & validation loss values
         ax = axs[0]
@@ -259,16 +259,15 @@ def train(optimizer='LAMB',
 
         return model, model.predict(valid_dataset, verbose=1)
 
-
+    ## Load and Train
     with strategy.scope():
         transformer_layer = TFAutoModel.from_pretrained(model_id)
         model = build_model(transformer_layer, max_len=max_len)
-
     model, preds = train_model(model)
 
     ## Load Dataset
     valid = pd.read_csv('../input/jigsaw-multilingual-toxic-comment-classification/validation.csv')
-    test = pd.read_csv('../input/jigsaw-multilingual-toxic-comment-classification/test.csv')
+#     test = pd.read_csv('../input/jigsaw-multilingual-toxic-comment-classification/test.csv')
     sub = pd.read_csv('../input/jigsaw-multilingual-toxic-comment-classification/sample_submission.csv')
 
     valid['pred'] = preds
@@ -277,13 +276,12 @@ def train(optimizer='LAMB',
     valid_auc = roc_auc_score(valid.toxic, valid.pred)
     print('AUC:', valid_auc)
 
-    ax = valid.pred.hist(bins=100, log=True)
+    ax = valid.groupby('toxic').pred.hist(bins=100, log=True)
+    plt.legend([0, 1])
     save_fig('valid_hist.png')
     print('toxic:', valid.toxic.mean(), 'pred:', valid.pred.mean(), 'ratio:', (valid.pred > 0.5).mean())
 
-#     # [0.92, 1.7]
-#     print('AUC_bal:', roc_auc_score(valid.toxic, valid.pred, sample_weight=0.92+y_valid*0.78))
-
+    ## Submission
     test_dataset = tf.data.Dataset.from_tensor_slices(x_test).batch(batch_size)
     sub['toxic'] = model.predict(test_dataset, verbose=1)
     sub.to_csv(f'{gcs_path}/submission.csv', index=False)
