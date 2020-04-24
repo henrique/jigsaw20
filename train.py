@@ -16,7 +16,7 @@ from tensorflow.python.keras import backend as K
 from tensorflow.keras.layers import Dense, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.callbacks import ModelCheckpoint, Callback
 
 import transformers
 from transformers import TFAutoModel, AutoTokenizer
@@ -148,7 +148,6 @@ def train(optimizer='LAMB',
                 loss=loss,
                 metrics=['accuracy',
                          tf.keras.metrics.AUC(name='auc'),
-#                          tf.keras.metrics.AUC(name='auc_bal', label_weights=0.92+y_valid*0.78)
                         ]
             )
 
@@ -207,6 +206,7 @@ def train(optimizer='LAMB',
                                                             verbose=1,
                                                             save_best_only=True,
                                                             save_weights_only=True))
+        print(callbacks)
 
     #     try:
         history = model.fit(
@@ -275,12 +275,14 @@ def train(optimizer='LAMB',
     valid.to_csv(f'{gcs_path}/valid_oof.csv', index=False)
 
     valid_auc = roc_auc_score(valid.toxic, valid.pred)
+    print('AUC:', valid_auc)
 
     ax = valid.pred.hist(bins=100, log=True)
     save_fig('valid_hist.png')
-    print('toxic:', valid.toxic.mean(), 'pred:', valid.pred.mean(), (valid.pred > 0.5).mean())
-    print('AUC:', valid_auc)
-    print('AUC_bal:', roc_auc_score(valid.toxic, valid.pred, sample_weight=0.92+y_valid*0.78))
+    print('toxic:', valid.toxic.mean(), 'pred:', valid.pred.mean(), 'ratio:', (valid.pred > 0.5).mean())
+
+#     # [0.92, 1.7]
+#     print('AUC_bal:', roc_auc_score(valid.toxic, valid.pred, sample_weight=0.92+y_valid*0.78))
 
     test_dataset = tf.data.Dataset.from_tensor_slices(x_test).batch(batch_size)
     sub['toxic'] = model.predict(test_dataset, verbose=1)
@@ -288,7 +290,7 @@ def train(optimizer='LAMB',
 
     ax = sub.toxic.hist(bins=100, log=True)
     save_fig('sub_hist.png')
-    print('mean:', sub.toxic.mean(), (sub.toxic > 0.5).mean())
+    print('mean:', sub.toxic.mean(), 'ratio:', (sub.toxic > 0.5).mean())
     
     ## Save params
     params['auc'] = valid_auc
