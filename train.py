@@ -68,10 +68,12 @@ def train(optimizer='LAMB',
           dataset='../input/jigsaw-mltc-ds/jigsaw_mltc_ds436001s.npz',
           gcs='hm-eu-w4',
           path='jigsaw/test',
-          seed=0,
+          seed=None,
           tpu_id=None,
           callback=None):
     params = pd.DataFrame(dict(locals()), index=[0])
+    if seed is None:
+        params['seed'] = seed = np.random.randint(99)
     print(params.T)
     gc.collect()
 
@@ -114,7 +116,11 @@ def train(optimizer='LAMB',
 
     array = np.load(dataset)
     x_train, x_valid, x_test, y_train, y_valid = [array[k] for k in list(array)]
-    assert x_train.dtype is np.dtype('int32')
+    # Shuffle
+    x_train = pd.DataFrame(np.concatenate([x_train.T, [y_train]]).T
+                ).sample(frac=1, random_state=seed).values
+    assert abs(x_train[...,:-1] - x_train[...,:-1].astype('int32')).max() == 0
+    x_train, y_train = x_train[...,:-1].astype('int32'), x_train[...,-1].astype('float32')
     print(x_train.shape, x_valid.shape, x_test.shape, y_train.shape, y_valid.shape)
 
     # epoch duration
@@ -273,13 +279,26 @@ def train(optimizer='LAMB',
     valid['pred'] = preds
     valid.to_csv(f'{gcs_path}/valid_oof.csv', index=False)
 
-    valid_auc = roc_auc_score(valid.toxic, valid.pred)
-    print('AUC:', valid_auc)
-
-    ax = valid.groupby('toxic').pred.hist(bins=100, log=True)
+    ax = valid.groupby('toxic').pred.hist(bins=100, log=True, alpha=0.5)
     plt.legend([0, 1])
     save_fig('valid_hist.png')
-    print('toxic:', valid.toxic.mean(), 'pred:', valid.pred.mean(), 'ratio:', (valid.pred > 0.5).mean())
+
+    ax = valid[valid.toxic == 1].groupby('lang').pred.hist(bins=50, log=True, alpha=0.34)
+    plt.legend(valid.lang.unique())
+    save_fig('valid_toxic_hist.png')
+
+    valid_auc = roc_auc_score(valid.toxic, valid.pred)
+    print('AUC:', valid_auc,
+          'toxic:', valid.toxic.mean(),
+          'pred:', valid.pred.mean(),
+          'ratio:', (valid.pred > 0.5).mean())
+
+    # over sample toxic
+    bal_valid = valid.append(valid[valid.toxic == 1], ignore_index=True)
+    print('AUC_bal:', roc_auc_score(bal_valid.toxic, bal_valid.pred),
+          'toxic:', bal_valid.toxic.mean(),
+          'pred:', bal_valid.pred.mean(),
+          'ratio:', (bal_valid.pred > 0.5).mean())
 
     ## Submission
     test_dataset = tf.data.Dataset.from_tensor_slices(x_test).batch(batch_size)
