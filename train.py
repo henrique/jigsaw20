@@ -13,7 +13,7 @@ import tensorflow_addons as tfa
 from tensorflow_addons.optimizers.utils import fit_bn
 
 from tensorflow.python.keras import backend as K
-from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import ModelCheckpoint, Callback
@@ -68,14 +68,18 @@ def train(optimizer='LAMB',
           dataset='../input/jigsaw-mltc-ds/jigsaw_mltc_ds436001s.npz',
           gcs='hm-eu-w4',
           path='jigsaw/test',
-          seed=None,
+          seed=0,
+          amp=False,
           tpu_id=None,
           callback=None):
     params = pd.DataFrame(dict(locals()), index=[0])
-    if seed is None:
-        params['seed'] = seed = np.random.randint(99)
     print(params.T)
     gc.collect()
+
+    if amp:
+        print('Using auto_mixed_precision.')
+        tf.config.optimizer.set_jit(True)
+        tf.config.optimizer.set_experimental_options({"auto_mixed_precision": True})
 
     if tpu_id is None:
         with open('tpu', 'r') as content_file:
@@ -146,8 +150,9 @@ def train(optimizer='LAMB',
         elif optimizer == 'AdamW':
             opt = tfa.optimizers.AdamW(lr=lr, weight_decay=weight_decay)
 
-#         if moving_average is not None and moving_average > 0:
-#             opt = tfa.optimizers.MovingAverage(opt, average_decay=moving_average)
+        if amp:
+            opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, 'dynamic')
+            print(amp, opt)
 
         model.compile(
                 optimizer=opt,
