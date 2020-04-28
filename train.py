@@ -1,6 +1,9 @@
+import os
+import gc
+import time
+import random
 
-import os, gc, sys, time, random
-
+import logging
 import numpy as np
 import pandas as pd
 from tqdm.notebook import tqdm
@@ -8,11 +11,11 @@ from matplotlib import pyplot as plt
 from sklearn.metrics import roc_auc_score
 from google.cloud import storage
 
-import tensorflow as tf
 import tensorflow_addons as tfa
 from tensorflow_addons.optimizers.utils import fit_bn
 
-from tensorflow.python.keras import backend as K
+import tensorflow as tf
+from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.models import Model
@@ -25,7 +28,6 @@ from tokenizers import Tokenizer, models, pre_tokenizers, decoders, processors
 
 from one_cycle_scheduler import OneCycleScheduler
 
-import logging
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
 
@@ -52,7 +54,7 @@ def focal_loss(gamma=2., pos_weight=1, label_smoothing=0.05):
         loss = labels * pos_loss + (1 - labels) * neg_loss
 
         return loss
-    
+
     return binary_focal_loss
 
 
@@ -60,8 +62,8 @@ def build_model(model_id='jplu/tf-xlm-roberta-large', max_len=192,
                 optimizer='LAMB', lr=2e-5, weight_decay=1e-6,
                 loss_fn='bce', label_smoothing=0.01,
                 pos_weight=5, gamma=2.0,  ## focal loss
-                dropout=0.2,
-                amp=False, **kwargs):
+                dropout=0.2, amp=False,
+                **_):
     transformer = TFAutoModel.from_pretrained(model_id)
 
     input_word_ids = Input(shape=(max_len,), dtype=tf.int32, name="input_word_ids")
@@ -89,12 +91,12 @@ def build_model(model_id='jplu/tf-xlm-roberta-large', max_len=192,
         opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, 'dynamic')
 
     model.compile(
-            optimizer=opt,
-            loss=loss,
-            metrics=['accuracy',
-                     tf.keras.metrics.AUC(name='auc'),
-                    ]
-        )
+        optimizer=opt,
+        loss=loss,
+        metrics=['accuracy',
+                 tf.keras.metrics.AUC(name='auc'),
+                ]
+    )
 
     return model
 
@@ -105,39 +107,29 @@ def save_fig(filename, path, gcs):
     # init GCS client and upload file
     client = storage.Client()
     bucket = client.get_bucket(gcs)
-    blob   = bucket.blob(f'{path}/{filename}')
-    content = blob.upload_from_filename(filename=filename)
+    blob = bucket.blob(f'{path}/{filename}')
+    blob.upload_from_filename(filename=filename)
 
 
-def train_model(model, strategy,
-                checkpoint_path, dataset,
-                seed=0, epochs=30, steps_per_epoch=250,
-                lr=2e-5, one_cycle=True, warm_up=1,
-                mom_min=0.85, mom_max=0.95,
-                div_factor=100, final_div_factor=250,
-                batch_size=28, callback=None,
-                **kwargs):
-    batch_size = batch_size * strategy.num_replicas_in_sync
-    print('batch_size:', batch_size)
-
+def np_dataset(dataset, batch_size, seed):
     array = np.load(dataset)
     x_train, x_valid, x_test, y_train, y_valid = [array[k] for k in list(array)]
     # Shuffle
     x_train = pd.DataFrame(np.concatenate([x_train.T, [y_train]]).T
-                ).sample(frac=1, random_state=seed).values
-    assert abs(x_train[...,:-1] - x_train[...,:-1].astype('int32')).max() == 0
-    x_train, y_train = x_train[...,:-1].astype('int32'), x_train[...,-1].astype('float32')
+                          ).sample(frac=1, random_state=seed).values
+    assert abs(x_train[..., :-1] - x_train[..., :-1].astype('int32')).max() == 0
+    x_train, y_train = x_train[..., :-1].astype('int32'), x_train[..., -1].astype('float32')
     print(x_train.shape, x_valid.shape, x_test.shape, y_train.shape, y_valid.shape)
 
     ## Set Datasets
-    AUTO = tf.data.experimental.AUTOTUNE
+    auto_tune = tf.data.experimental.AUTOTUNE
     train_dataset = (
         tf.data.Dataset
         .from_tensor_slices((x_train, y_train))
         .repeat()
         .shuffle(2048)
         .batch(batch_size)
-        .prefetch(AUTO)
+        .prefetch(auto_tune)
     )
 
     valid_dataset = (
@@ -145,50 +137,120 @@ def train_model(model, strategy,
         .from_tensor_slices((x_valid, y_valid))
         .batch(batch_size)
         .cache()
-        .prefetch(AUTO)
+        .prefetch(auto_tune)
     )
 
     test_dataset = (
         tf.data.Dataset
         .from_tensor_slices(x_test)
         .batch(batch_size)
-        .prefetch(AUTO)
+        .prefetch(auto_tune)
     )
 
+    return train_dataset, valid_dataset, test_dataset
+
+
+def tf_dataset(dataset, batch_size, max_len, seed):
+    auto_tune = tf.data.experimental.AUTOTUNE
+
+    train_dataset = (
+        load_tf_dataset(dataset+'train*.tfrec', max_len, seed)
+        .repeat()
+        .shuffle(2048)
+        .batch(batch_size)
+        .prefetch(auto_tune)
+    )
+
+    valid_dataset = (
+        load_tf_dataset(dataset+'valid*.tfrec', max_len, seed)
+        .batch(batch_size)
+        .cache()
+        .prefetch(auto_tune)
+    )
+
+    test_dataset = (
+        load_tf_dataset(dataset+'valid*.tfrec', max_len, seed)
+        .batch(batch_size)
+        .prefetch(auto_tune)
+    )
+
+    return train_dataset, valid_dataset, test_dataset
+
+def load_tf_dataset(filenames, max_len, seed, ordered=False):
+    # Read from TFRecords. For optimal performance, reading from multiple files at once and
+    # disregarding data order. Order does not matter since we will be shuffling the data anyway.
+    auto_tune = tf.data.experimental.AUTOTUNE
+
+    def read_labeled_tfrecord(example, max_len=max_len):
+        tf_format = {
+            "data": tf.io.FixedLenFeature(max_len, tf.int64),
+            "label": tf.io.FixedLenFeature([], tf.float32),  # shape [] means single element
+        }
+        example = tf.io.parse_single_example(example, tf_format)
+        return example['data'], example['label']
+
+    ignore_order = tf.data.Options()
+    if not ordered:
+        ignore_order.experimental_deterministic = False # disable order, increase speed
+
+    # expand and shuffle files
+    filenames = tf.io.gfile.glob(filenames)
+    random.Random(seed).shuffle(filenames)
+    # automatically interleaves reads from multiple files
+    dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=auto_tune)
+    # uses data as soon as it streams in, rather than in its original order
+    dataset = dataset.with_options(ignore_order)
+    dataset = dataset.map(read_labeled_tfrecord, num_parallel_calls=auto_tune)
+    return dataset
+
+
+def train_model(model, strategy, checkpoint_path,
+                dataset, max_len=192, seed=0,
+                epochs=30, steps_per_epoch=250,
+                lr=2e-5, one_cycle=True, warm_up=1,
+                mom_min=0.85, mom_max=0.95,
+                div_factor=100, final_div_factor=250,
+                batch_size=28, callback=None,
+                **_):
+    batch_size = batch_size * strategy.num_replicas_in_sync
+    print('batch_size:', batch_size)
+
+    if dataset.startswith('gs://'):
+        train_dataset, valid_dataset, test_dataset = tf_dataset(dataset, batch_size, max_len, seed)
+    else:
+        train_dataset, valid_dataset, test_dataset = np_dataset(dataset, batch_size, seed)
 
     ## Train
     callbacks = [] if callback is None else [callback]
-    callbacks.append(tf.keras.callbacks.EarlyStopping(monitor='val_auc', min_delta=1e-4, mode='max',
-                                                      patience=6, verbose=1, restore_best_weights=True))
+    callbacks.append(tf.keras.callbacks.EarlyStopping(monitor='val_auc', min_delta=1e-4,
+                                                      mode='max', patience=6, verbose=1,
+                                                      restore_best_weights=True))
 
     if one_cycle:
         callbacks.append(OneCycleScheduler(lr_max=lr, steps=steps_per_epoch*epochs,
-                                           mom_min=mom_min, mom_max=mom_max, phase_1_pct=warm_up/epochs,
-                                           div_factor=div_factor, final_div_factor=final_div_factor))
+                                           mom_min=mom_min, mom_max=mom_max,
+                                           phase_1_pct=warm_up/epochs,
+                                           div_factor=div_factor,
+                                           final_div_factor=final_div_factor))
     else:
         callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(monitor='val_auc', factor=0.31,
-                                                              patience=2, cooldown=1,
-                                                              verbose=1, mode='max', min_delta=1e-4))
+                                                              patience=2, cooldown=1, mode='max',
+                                                              verbose=1, min_delta=1e-4))
 
     callbacks.append(tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_path,
-                                                        monitor='val_auc', mode='max',
-                                                        verbose=1,
+                                                        monitor='val_auc',
+                                                        verbose=1, mode='max',
                                                         save_best_only=True,
                                                         save_weights_only=True))
     print(callbacks)
 
-#     try:
-    history = model.fit(
+    model.fit(
         train_dataset,
         steps_per_epoch=steps_per_epoch,
         validation_data=valid_dataset,
         epochs=epochs,
         callbacks=callbacks,
     )
-#     except Exception as ex:
-#         print(ex)
-#         history = model.history
-
 
     # load best
     if epochs > 1:
@@ -202,7 +264,7 @@ def train_model(model, strategy,
 
 def plot_history(history, path, bucket):
     ## Eval
-    fig, axs = plt.subplots(1, 3, figsize=(18,4))
+    _, axs = plt.subplots(1, 3, figsize=(18, 4))
     # Plot training & validation loss values
     ax = axs[0]
     ax.plot(history.history['loss'])
@@ -241,7 +303,8 @@ def plot_history(history, path, bucket):
 ##################
 
 def train(gcs='hm-eu-w4', path='jigsaw/test',
-          seed=0, tpu_id=None, **kwargs):
+          seed=0, max_len=192, tpu_id=None,
+          **kwargs):
     params = dict(locals())
     params.update(kwargs)
     params = pd.DataFrame(params, index=[0])
@@ -288,7 +351,7 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
     with strategy.scope():
         model = build_model(**kw_params)
     model, preds, sub = train_model(model, strategy, checkpoint_path, **kw_params)
-    
+
     ## Save results
     plot_history(model.history, path, gcs)
     history = pd.DataFrame(model.history.history)
@@ -296,9 +359,10 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
     history.to_csv(f'{gcs_path}/history.csv', index=False)
 
     ## Load Dataset
-    valid = pd.read_csv('../input/jigsaw-multilingual-toxic-comment-classification/validation.csv')
-#     test = pd.read_csv('../input/jigsaw-multilingual-toxic-comment-classification/test.csv')
-    sub = pd.read_csv('../input/jigsaw-multilingual-toxic-comment-classification/sample_submission.csv')
+    comp_ds = '../input/jigsaw-multilingual-toxic-comment-classification'
+    valid = pd.read_csv(f'{comp_ds}/validation.csv')
+#     test = pd.read_csv(f'{comp_ds}/test.csv')
+    sub = pd.read_csv(f'{comp_ds}/sample_submission.csv')
 
     valid['pred'] = preds
     valid.to_csv(f'{gcs_path}/valid_oof.csv', index=False)
@@ -331,7 +395,7 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
     ax = sub.toxic.hist(bins=100, log=True)
     save_fig('sub_hist.png', path, gcs)
     print('mean:', sub.toxic.mean(), 'ratio:', (sub.toxic > 0.5).mean())
-    
+
     ## Save params
     params['auc'] = valid_auc
     params.to_csv(f'{gcs_path}/params{valid_auc:04f}.csv', index=False)
