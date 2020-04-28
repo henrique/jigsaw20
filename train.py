@@ -17,6 +17,7 @@ from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import ModelCheckpoint, Callback
+from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
 import transformers
 from transformers import TFAutoModel, AutoTokenizer
@@ -55,31 +56,204 @@ def focal_loss(gamma=2., pos_weight=1, label_smoothing=0.05):
     return binary_focal_loss
 
 
-def train(optimizer='LAMB',
-          lr=2e-5, weight_decay=1e-6,
-          dropout=0,
-          loss_fn='bce',
-          label_smoothing=0.01,
-          pos_weight=5, gamma=2.0,  ## focal loss
-          epochs=30, stages=10,
-          one_cycle=True, warm_up=1,
-          batch_size=28,
-          model_id='jplu/tf-xlm-roberta-large',
-          dataset='../input/jigsaw-mltc-ds/jigsaw_mltc_ds436001s.npz',
-          gcs='hm-eu-w4',
-          path='jigsaw/test',
-          seed=0,
-          amp=False,
-          tpu_id=None,
-          callback=None):
-    params = pd.DataFrame(dict(locals()), index=[0])
-    print(params.T)
-    gc.collect()
+def build_model(model_id='jplu/tf-xlm-roberta-large', max_len=192,
+                optimizer='LAMB', lr=2e-5, weight_decay=1e-6,
+                loss_fn='bce', label_smoothing=0.01,
+                pos_weight=5, gamma=2.0,  ## focal loss
+                dropout=0.2,
+                amp=False, **kwargs):
+    transformer = TFAutoModel.from_pretrained(model_id)
+
+    input_word_ids = Input(shape=(max_len,), dtype=tf.int32, name="input_word_ids")
+    sequence_output = transformer(input_word_ids)[0]
+    cls_token = sequence_output[:, 0, :]
+    if dropout > 0:
+        cls_token = Dropout(dropout)(cls_token)
+    out = Dense(1, activation='sigmoid')(cls_token)
+    model = Model(inputs=input_word_ids, outputs=out)
+
+    if loss_fn == 'focal':
+        loss = focal_loss(pos_weight=pos_weight, gamma=gamma, label_smoothing=label_smoothing)
+    elif loss_fn == 'bce':
+        loss = tf.keras.losses.BinaryCrossentropy(label_smoothing=label_smoothing)
+
+    if optimizer == 'LAMB':
+        opt = tfa.optimizers.LAMB(lr=lr, weight_decay_rate=weight_decay)
+    elif optimizer == 'AdamW':
+        opt = tfa.optimizers.AdamW(lr=lr, weight_decay=weight_decay)
 
     if amp:
         print('Using auto_mixed_precision.')
         tf.config.optimizer.set_jit(True)
         tf.config.optimizer.set_experimental_options({"auto_mixed_precision": True})
+        opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, 'dynamic')
+
+    model.compile(
+            optimizer=opt,
+            loss=loss,
+            metrics=['accuracy',
+                     tf.keras.metrics.AUC(name='auc'),
+                    ]
+        )
+
+    return model
+
+
+def save_fig(filename, path, gcs):
+    plt.gcf().savefig(filename)
+    plt.close()
+    # init GCS client and upload file
+    client = storage.Client()
+    bucket = client.get_bucket(gcs)
+    blob   = bucket.blob(f'{path}/{filename}')
+    content = blob.upload_from_filename(filename=filename)
+
+
+def train_model(model, strategy,
+                checkpoint_path, dataset,
+                seed=0, epochs=30, steps_per_epoch=250,
+                lr=2e-5, one_cycle=True, warm_up=1,
+                mom_min=0.85, mom_max=0.95,
+                div_factor=100, final_div_factor=250,
+                batch_size=28, callback=None,
+                **kwargs):
+    batch_size = batch_size * strategy.num_replicas_in_sync
+    print('batch_size:', batch_size)
+
+    array = np.load(dataset)
+    x_train, x_valid, x_test, y_train, y_valid = [array[k] for k in list(array)]
+    # Shuffle
+    x_train = pd.DataFrame(np.concatenate([x_train.T, [y_train]]).T
+                ).sample(frac=1, random_state=seed).values
+    assert abs(x_train[...,:-1] - x_train[...,:-1].astype('int32')).max() == 0
+    x_train, y_train = x_train[...,:-1].astype('int32'), x_train[...,-1].astype('float32')
+    print(x_train.shape, x_valid.shape, x_test.shape, y_train.shape, y_valid.shape)
+
+    ## Set Datasets
+    AUTO = tf.data.experimental.AUTOTUNE
+    train_dataset = (
+        tf.data.Dataset
+        .from_tensor_slices((x_train, y_train))
+        .repeat()
+        .shuffle(2048)
+        .batch(batch_size)
+        .prefetch(AUTO)
+    )
+
+    valid_dataset = (
+        tf.data.Dataset
+        .from_tensor_slices((x_valid, y_valid))
+        .batch(batch_size)
+        .cache()
+        .prefetch(AUTO)
+    )
+
+    test_dataset = (
+        tf.data.Dataset
+        .from_tensor_slices(x_test)
+        .batch(batch_size)
+        .prefetch(AUTO)
+    )
+
+
+    ## Train
+    callbacks = [] if callback is None else [callback]
+    callbacks.append(tf.keras.callbacks.EarlyStopping(monitor='val_auc', min_delta=1e-4, mode='max',
+                                                      patience=6, verbose=1, restore_best_weights=True))
+
+    if one_cycle:
+        callbacks.append(OneCycleScheduler(lr_max=lr, steps=steps_per_epoch*epochs,
+                                           mom_min=mom_min, mom_max=mom_max, phase_1_pct=warm_up/epochs,
+                                           div_factor=div_factor, final_div_factor=final_div_factor))
+    else:
+        callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(monitor='val_auc', factor=0.31,
+                                                              patience=2, cooldown=1,
+                                                              verbose=1, mode='max', min_delta=1e-4))
+
+    callbacks.append(tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_path,
+                                                        monitor='val_auc', mode='max',
+                                                        verbose=1,
+                                                        save_best_only=True,
+                                                        save_weights_only=True))
+    print(callbacks)
+
+#     try:
+    history = model.fit(
+        train_dataset,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=valid_dataset,
+        epochs=epochs,
+        callbacks=callbacks,
+    )
+#     except Exception as ex:
+#         print(ex)
+#         history = model.history
+
+
+    # load best
+    if epochs > 1:
+        # latest = tf.train.latest_checkpoint(checkpoint_dir)
+        with strategy.scope():
+            model.load_weights(checkpoint_path)
+
+    return (model,
+            model.predict(valid_dataset, verbose=1),
+            model.predict(test_dataset, verbose=1))
+
+def plot_history(history, path, bucket):
+    ## Eval
+    fig, axs = plt.subplots(1, 3, figsize=(18,4))
+    # Plot training & validation loss values
+    ax = axs[0]
+    ax.plot(history.history['loss'])
+    ax.plot(history.history['val_loss'])
+    ax.set_title('Model loss')
+    ax.set_yscale('log')
+    ax.set_ylabel('Loss')
+    ax.set_xlabel('Epoch')
+    ax.legend(['Train', 'Test'], loc='lower left')
+
+    # Plot training & validation accuracy values
+    ax = axs[1]
+    ax.plot(history.history['accuracy'])
+    ax.plot(history.history['val_accuracy'])
+    ax.set_title('Model accuracy')
+    ax.set_ylabel('Accuracy')
+    ax.set_xlabel('Epoch')
+    ax.legend(['Train', 'Test'], loc='upper left')
+
+    # Plot training & validation accuracy values
+    ax = axs[2]
+    ax.plot(history.history['auc'])
+    ax.plot(history.history['val_auc'])
+    ax.set_title('Model AUC')
+    ax.set_ylabel('AUC')
+    ax.set_xlabel('Epoch')
+    ax.legend(['Train', 'Test'], loc='upper left')
+
+    save_fig('history.png', path, bucket)
+
+
+
+
+##################
+###### MAIN ######
+##################
+
+def train(gcs='hm-eu-w4', path='jigsaw/test',
+          seed=0, tpu_id=None, **kwargs):
+    params = dict(locals())
+    params.update(kwargs)
+    params = pd.DataFrame(params, index=[0])
+    kw_params = params.T[0].to_dict()
+    print(params.T)
+    gc.collect()
+
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
 
     if tpu_id is None:
         with open('tpu', 'r') as content_file:
@@ -105,176 +279,21 @@ def train(optimizer='LAMB',
     print("REPLICAS: ", strategy.num_replicas_in_sync)
 
     ## Configuration
-    batch_size = batch_size * strategy.num_replicas_in_sync if tpu else 1
-    max_len=192
     path = f'{path}/{time.strftime("%Y%m%d_%H%M%S")}_{tpu_id}'
     gcs_path = f'gs://{gcs}/{path}'
+    checkpoint_path = f"{gcs_path}/best_model.tf"
     print('gcs_path:', gcs_path)
-    print('batch_size:', batch_size)
-    
-    random.seed(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['TF_DETERMINISTIC_OPS'] = '1'
-
-    array = np.load(dataset)
-    x_train, x_valid, x_test, y_train, y_valid = [array[k] for k in list(array)]
-    # Shuffle
-    x_train = pd.DataFrame(np.concatenate([x_train.T, [y_train]]).T
-                ).sample(frac=1, random_state=seed).values
-    assert abs(x_train[...,:-1] - x_train[...,:-1].astype('int32')).max() == 0
-    x_train, y_train = x_train[...,:-1].astype('int32'), x_train[...,-1].astype('float32')
-    print(x_train.shape, x_valid.shape, x_test.shape, y_train.shape, y_valid.shape)
-
-    # epoch duration
-    steps_per_epoch = (x_train.shape[0] // batch_size) // stages
-
-    def build_model(transformer, max_len=512, dropout=dropout):
-        """ https://www.kaggle.com/xhlulu/jigsaw-tpu-distilbert-with-huggingface-and-keras """
-        input_word_ids = Input(shape=(max_len,), dtype=tf.int32, name="input_word_ids")
-        sequence_output = transformer(input_word_ids)[0]
-        cls_token = sequence_output[:, 0, :]
-        if dropout > 0:
-            cls_token = Dropout(dropout)(cls_token)
-        out = Dense(1, activation='sigmoid')(cls_token)
-        model = Model(inputs=input_word_ids, outputs=out)
-
-        if loss_fn == 'focal':
-            loss = focal_loss(pos_weight=pos_weight, gamma=gamma, label_smoothing=label_smoothing)
-        elif loss_fn == 'bce':
-            loss = tf.keras.losses.BinaryCrossentropy(label_smoothing=label_smoothing)
-
-        if optimizer == 'LAMB':
-            opt = tfa.optimizers.LAMB(lr=lr, weight_decay_rate=weight_decay)
-        elif optimizer == 'AdamW':
-            opt = tfa.optimizers.AdamW(lr=lr, weight_decay=weight_decay)
-
-        if amp:
-            opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, 'dynamic')
-            print(amp, opt)
-
-        model.compile(
-                optimizer=opt,
-                loss=loss,
-                metrics=['accuracy',
-                         tf.keras.metrics.AUC(name='auc'),
-                        ]
-            )
-
-        return model
-
-
-    def save_fig(filename, path=path, bucket=gcs):
-        plt.gcf().savefig(filename)
-        plt.close()
-        # init GCS client and upload file
-        client = storage.Client()
-        bucket = client.get_bucket('hm-eu-w4')
-        blob = bucket.blob(f'{path}/' + filename)
-        content = blob.upload_from_filename(filename=filename)
-
-
-    def train_model(model):
-        ## Set Datasets
-        AUTO = tf.data.experimental.AUTOTUNE
-        train_dataset = (
-            tf.data.Dataset
-            .from_tensor_slices((x_train, y_train))
-            .repeat()
-            .shuffle(2048)
-            .batch(batch_size)
-            .prefetch(AUTO)
-        )
-
-        valid_dataset = (
-            tf.data.Dataset
-            .from_tensor_slices((x_valid, y_valid))
-            .batch(batch_size)
-            .cache()
-            .prefetch(AUTO)
-        )
-
-
-        ## Train
-        callbacks = [] if callback is None else [callback]
-        callbacks.append(tf.keras.callbacks.EarlyStopping(monitor='val_auc', min_delta=1e-4, mode='max',
-                                                          patience=6, verbose=1, restore_best_weights=True))
-
-        if one_cycle:
-            callbacks.append(OneCycleScheduler(lr_max=lr, steps=steps_per_epoch*epochs,
-                                               mom_min=0.85, mom_max=0.95, phase_1_pct=warm_up/epochs,
-                                               div_factor=100, final_div_factor=250))
-        else:
-            callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(monitor='val_auc', factor=0.31,
-                                                                  patience=2, cooldown=1,
-                                                                  verbose=1, mode='max', min_delta=1e-4))
-
-
-        checkpoint_path = f"{gcs_path}/best_model.tf"
-        callbacks.append(tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_path,
-                                                            monitor='val_auc', mode='max',
-                                                            verbose=1,
-                                                            save_best_only=True,
-                                                            save_weights_only=True))
-        print(callbacks)
-
-    #     try:
-        history = model.fit(
-            train_dataset,
-            steps_per_epoch=steps_per_epoch,
-            validation_data=valid_dataset,
-            epochs=epochs,
-            callbacks=callbacks,
-        )
-    #     except Exception as ex:
-    #         print(ex)
-    #         history = model.history
-
-        ## Eval
-        fig, axs = plt.subplots(1, 3, figsize=(18,4))
-        # Plot training & validation loss values
-        ax = axs[0]
-        ax.plot(history.history['loss'])
-        ax.plot(history.history['val_loss'])
-        ax.set_title('Model loss')
-        ax.set_yscale('log')
-        ax.set_ylabel('Loss')
-        ax.set_xlabel('Epoch')
-        ax.legend(['Train', 'Test'], loc='lower left')
-
-        # Plot training & validation accuracy values
-        ax = axs[1]
-        ax.plot(history.history['accuracy'])
-        ax.plot(history.history['val_accuracy'])
-        ax.set_title('Model accuracy')
-        ax.set_ylabel('Accuracy')
-        ax.set_xlabel('Epoch')
-        ax.legend(['Train', 'Test'], loc='upper left')
-
-        # Plot training & validation accuracy values
-        ax = axs[2]
-        ax.plot(history.history['auc'])
-        ax.plot(history.history['val_auc'])
-        ax.set_title('Model AUC')
-        ax.set_ylabel('AUC')
-        ax.set_xlabel('Epoch')
-        ax.legend(['Train', 'Test'], loc='upper left')
-
-        save_fig('history.png')
-
-        # load best
-        # latest = tf.train.latest_checkpoint(checkpoint_dir)
-        with strategy.scope():
-            model.load_weights(checkpoint_path)
-
-        return model, model.predict(valid_dataset, verbose=1)
 
     ## Load and Train
     with strategy.scope():
-        transformer_layer = TFAutoModel.from_pretrained(model_id)
-        model = build_model(transformer_layer, max_len=max_len)
-    model, preds = train_model(model)
+        model = build_model(**kw_params)
+    model, preds, sub = train_model(model, strategy, checkpoint_path, **kw_params)
+    
+    ## Save results
+    plot_history(model.history, path, gcs)
+    history = pd.DataFrame(model.history.history)
+    print(history)
+    history.to_csv(f'{gcs_path}/history.csv', index=False)
 
     ## Load Dataset
     valid = pd.read_csv('../input/jigsaw-multilingual-toxic-comment-classification/validation.csv')
@@ -286,11 +305,11 @@ def train(optimizer='LAMB',
 
     ax = valid.groupby('toxic').pred.hist(bins=100, log=True, alpha=0.5)
     plt.legend([0, 1])
-    save_fig('valid_hist.png')
+    save_fig('valid_hist.png', path, gcs)
 
     ax = valid[valid.toxic == 1].groupby('lang').pred.hist(bins=50, log=True, alpha=0.34)
     plt.legend(valid.lang.unique())
-    save_fig('valid_toxic_hist.png')
+    save_fig('valid_toxic_hist.png', path, gcs)
 
     valid_auc = roc_auc_score(valid.toxic, valid.pred)
     print('AUC:', valid_auc,
@@ -306,12 +325,11 @@ def train(optimizer='LAMB',
           'ratio:', (bal_valid.pred > 0.5).mean())
 
     ## Submission
-    test_dataset = tf.data.Dataset.from_tensor_slices(x_test).batch(batch_size)
-    sub['toxic'] = model.predict(test_dataset, verbose=1)
+    sub['toxic'] = sub
     sub.to_csv(f'{gcs_path}/submission.csv', index=False)
 
     ax = sub.toxic.hist(bins=100, log=True)
-    save_fig('sub_hist.png')
+    save_fig('sub_hist.png', path, gcs)
     print('mean:', sub.toxic.mean(), 'ratio:', (sub.toxic > 0.5).mean())
     
     ## Save params
