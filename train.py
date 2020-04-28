@@ -151,6 +151,32 @@ def np_dataset(dataset, batch_size, seed):
     return train_dataset, valid_dataset, test_dataset
 
 
+def val_np_dataset(dataset='../input/jigsaw20-val-test-ds/jigsaw20_val_ds.npz', batch_size=128):
+    """ load npz datasets """
+    array = np.load(dataset)
+    x_valid, x_test, y_valid = [array[k] for k in list(array)]
+    print(x_valid.shape, x_test.shape, y_valid.shape)
+
+    ## Set Datasets
+    auto_tune = tf.data.experimental.AUTOTUNE
+    valid_dataset = (
+        tf.data.Dataset
+        .from_tensor_slices((x_valid, y_valid))
+        .batch(batch_size)
+        .cache()
+        .prefetch(auto_tune)
+    )
+
+    test_dataset = (
+        tf.data.Dataset
+        .from_tensor_slices(x_test)
+        .batch(batch_size)
+        .prefetch(auto_tune)
+    )
+
+    return valid_dataset, test_dataset
+
+
 def tf_dataset(dataset, batch_size, max_len, seed):
     """ load tfrec datasets """
     auto_tune = tf.data.experimental.AUTOTUNE
@@ -163,18 +189,7 @@ def tf_dataset(dataset, batch_size, max_len, seed):
         .prefetch(auto_tune)
     )
 
-    valid_dataset = (
-        load_tf_dataset(dataset+'valid*.tfrec', max_len, seed)
-        .batch(batch_size)
-        .cache()
-        .prefetch(auto_tune)
-    )
-
-    test_dataset = (
-        load_tf_dataset(dataset+'test*.tfrec', max_len, seed)
-        .batch(batch_size)
-        .prefetch(auto_tune)
-    )
+    valid_dataset, test_dataset = val_np_dataset(batch_size=batch_size)
 
     return train_dataset, valid_dataset, test_dataset
 
@@ -342,6 +357,10 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
     params = dict(locals())
     params.update(kwargs)
     params = pd.DataFrame(params, index=[0])
+    del params['kwargs']
+    if params.loc[0, 'loss_fn'] != 'focal':
+        del params['gamma']
+        del params['pos_weight']
     kw_params = params.T[0].to_dict()
     print(params.T)
     gc.collect()
@@ -359,11 +378,12 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
     gcs_path = f'gs://{gcs}/{path}'
     checkpoint_path = f"{gcs_path}/best_model.tf"
     print('gcs_path:', gcs_path)
+    params['gcs_path'] = gcs_path
 
     ## Load and Train
     with strategy.scope():
         model = build_model(**kw_params)
-    model, preds, sub = train_model(model, strategy, checkpoint_path, **kw_params)
+    model, preds, sub_y = train_model(model, strategy, checkpoint_path, **kw_params)
 
     ## Save results
     plot_history(model.history, path, gcs)
@@ -394,15 +414,8 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
           'pred:', valid.pred.mean(),
           'ratio:', (valid.pred > 0.5).mean())
 
-    # over sample toxic
-    bal_valid = valid.append(valid[valid.toxic == 1], ignore_index=True)
-    print('AUC_bal:', roc_auc_score(bal_valid.toxic, bal_valid.pred),
-          'toxic:', bal_valid.toxic.mean(),
-          'pred:', bal_valid.pred.mean(),
-          'ratio:', (bal_valid.pred > 0.5).mean())
-
     ## Submission
-    sub['toxic'] = sub
+    sub['toxic'] = sub_y
     sub.to_csv(f'{gcs_path}/submission.csv', index=False)
 
     sub.toxic.hist(bins=100, log=True)
