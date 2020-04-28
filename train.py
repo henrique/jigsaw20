@@ -1,3 +1,5 @@
+""" build and train a TFAutoModel from npz or tfrec dataset """
+
 import os
 import gc
 import time
@@ -6,33 +8,29 @@ import random
 import logging
 import numpy as np
 import pandas as pd
-from tqdm.notebook import tqdm
+# from tqdm.notebook import tqdm
 from matplotlib import pyplot as plt
 from sklearn.metrics import roc_auc_score
 from google.cloud import storage
 
 import tensorflow_addons as tfa
-from tensorflow_addons.optimizers.utils import fit_bn
+# from tensorflow_addons.optimizers.utils import fit_bn
 
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Dense, Dropout, Input
-from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import ModelCheckpoint, Callback
-from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
-import transformers
-from transformers import TFAutoModel, AutoTokenizer
-from tokenizers import Tokenizer, models, pre_tokenizers, decoders, processors
-
+from transformers import TFAutoModel
 from one_cycle_scheduler import OneCycleScheduler
 
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
 
 def focal_loss(gamma=2., pos_weight=1, label_smoothing=0.05):
+    """ binary focal loss with label_smoothing """
     def binary_focal_loss(labels, p):
+        """ bfl clojure """
         labels = tf.dtypes.cast(labels, dtype=p.dtype)
         if label_smoothing is not None:
             labels = (1 - label_smoothing) * labels + label_smoothing * 0.5
@@ -64,6 +62,7 @@ def build_model(model_id='jplu/tf-xlm-roberta-large', max_len=192,
                 pos_weight=5, gamma=2.0,  ## focal loss
                 dropout=0.2, amp=False,
                 **_):
+    """ build a TFAutoModel """
     transformer = TFAutoModel.from_pretrained(model_id)
 
     input_word_ids = Input(shape=(max_len,), dtype=tf.int32, name="input_word_ids")
@@ -102,6 +101,7 @@ def build_model(model_id='jplu/tf-xlm-roberta-large', max_len=192,
 
 
 def save_fig(filename, path, gcs):
+    """ save current plt fig to gcs """
     plt.gcf().savefig(filename)
     plt.close()
     # init GCS client and upload file
@@ -112,6 +112,7 @@ def save_fig(filename, path, gcs):
 
 
 def np_dataset(dataset, batch_size, seed):
+    """ load npz datasets """
     array = np.load(dataset)
     x_train, x_valid, x_test, y_train, y_valid = [array[k] for k in list(array)]
     # Shuffle
@@ -151,6 +152,7 @@ def np_dataset(dataset, batch_size, seed):
 
 
 def tf_dataset(dataset, batch_size, max_len, seed):
+    """ load tfrec datasets """
     auto_tune = tf.data.experimental.AUTOTUNE
 
     train_dataset = (
@@ -169,7 +171,7 @@ def tf_dataset(dataset, batch_size, max_len, seed):
     )
 
     test_dataset = (
-        load_tf_dataset(dataset+'valid*.tfrec', max_len, seed)
+        load_tf_dataset(dataset+'test*.tfrec', max_len, seed)
         .batch(batch_size)
         .prefetch(auto_tune)
     )
@@ -177,11 +179,13 @@ def tf_dataset(dataset, batch_size, max_len, seed):
     return train_dataset, valid_dataset, test_dataset
 
 def load_tf_dataset(filenames, max_len, seed, ordered=False):
+    """ load a tfrec dataset """
     # Read from TFRecords. For optimal performance, reading from multiple files at once and
     # disregarding data order. Order does not matter since we will be shuffling the data anyway.
     auto_tune = tf.data.experimental.AUTOTUNE
 
     def read_labeled_tfrecord(example, max_len=max_len):
+        """ decode a tfrec """
         tf_format = {
             "data": tf.io.FixedLenFeature(max_len, tf.int64),
             "label": tf.io.FixedLenFeature([], tf.float32),  # shape [] means single element
@@ -212,6 +216,7 @@ def train_model(model, strategy, checkpoint_path,
                 div_factor=100, final_div_factor=250,
                 batch_size=28, callback=None,
                 **_):
+    """ train the given model """
     batch_size = batch_size * strategy.num_replicas_in_sync
     print('batch_size:', batch_size)
 
@@ -262,7 +267,9 @@ def train_model(model, strategy, checkpoint_path,
             model.predict(valid_dataset, verbose=1),
             model.predict(test_dataset, verbose=1))
 
+
 def plot_history(history, path, bucket):
+    """ plot a save the model's history """
     ## Eval
     _, axs = plt.subplots(1, 3, figsize=(18, 4))
     # Plot training & validation loss values
@@ -296,28 +303,8 @@ def plot_history(history, path, bucket):
     save_fig('history.png', path, bucket)
 
 
-
-
-##################
-###### MAIN ######
-##################
-
-def train(gcs='hm-eu-w4', path='jigsaw/test',
-          seed=0, max_len=192, tpu_id=None,
-          **kwargs):
-    params = dict(locals())
-    params.update(kwargs)
-    params = pd.DataFrame(params, index=[0])
-    kw_params = params.T[0].to_dict()
-    print(params.T)
-    gc.collect()
-
-    random.seed(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['TF_DETERMINISTIC_OPS'] = '1'
-
+def setup_tpu(tpu_id):
+    """ resolve a tpu cluster """
     if tpu_id is None:
         with open('tpu', 'r') as content_file:
             tpu_id = content_file.read()
@@ -340,6 +327,32 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
         # Default distribution strategy in Tensorflow. Works on CPU and single GPU.
         strategy = tf.distribute.get_strategy()
     print("REPLICAS: ", strategy.num_replicas_in_sync)
+    return strategy
+
+
+
+##################
+###### MAIN ######
+##################
+
+def train(gcs='hm-eu-w4', path='jigsaw/test',
+          seed=0, max_len=192, tpu_id=None,
+          **kwargs):
+    """ build and train a TFAutoModel from npz or tfrec dataset """
+    params = dict(locals())
+    params.update(kwargs)
+    params = pd.DataFrame(params, index=[0])
+    kw_params = params.T[0].to_dict()
+    print(params.T)
+    gc.collect()
+
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+
+    strategy = setup_tpu(tpu_id)
 
     ## Configuration
     path = f'{path}/{time.strftime("%Y%m%d_%H%M%S")}_{tpu_id}'
@@ -367,11 +380,11 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
     valid['pred'] = preds
     valid.to_csv(f'{gcs_path}/valid_oof.csv', index=False)
 
-    ax = valid.groupby('toxic').pred.hist(bins=100, log=True, alpha=0.5)
+    valid.groupby('toxic').pred.hist(bins=100, log=True, alpha=0.5)
     plt.legend([0, 1])
     save_fig('valid_hist.png', path, gcs)
 
-    ax = valid[valid.toxic == 1].groupby('lang').pred.hist(bins=50, log=True, alpha=0.34)
+    valid[valid.toxic == 1].groupby('lang').pred.hist(bins=50, log=True, alpha=0.34)
     plt.legend(valid.lang.unique())
     save_fig('valid_toxic_hist.png', path, gcs)
 
@@ -392,7 +405,7 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
     sub['toxic'] = sub
     sub.to_csv(f'{gcs_path}/submission.csv', index=False)
 
-    ax = sub.toxic.hist(bins=100, log=True)
+    sub.toxic.hist(bins=100, log=True)
     save_fig('sub_hist.png', path, gcs)
     print('mean:', sub.toxic.mean(), 'ratio:', (sub.toxic > 0.5).mean())
 
