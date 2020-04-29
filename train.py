@@ -243,8 +243,8 @@ def train_model(model, strategy, checkpoint_path,
     ## Train
     callbacks = [] if callback is None else [callback]
     callbacks.append(tf.keras.callbacks.EarlyStopping(monitor='val_auc', min_delta=1e-4,
-                                                      mode='max', patience=6, verbose=1,
-                                                      restore_best_weights=True))
+                                                      mode='max', patience=epochs//5, verbose=1,
+                                                      restore_best_weights=False)) # restore later
 
     if one_cycle:
         callbacks.append(OneCycleScheduler(lr_max=lr, steps=steps_per_epoch*epochs,
