@@ -17,18 +17,18 @@ import tensorflow_addons as tfa
 import tensorflow as tf
 
 from one_cycle_scheduler import OneCycleScheduler
-from single_model import build_model, tf_dataset, np_dataset
 from visual import save_fig, plot_history
+from focal_loss import focal_loss
 
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
 
-def compile(model,
-            optimizer='LAMB', lr=2e-5, weight_decay=1e-6,
-            loss_fn='bce', label_smoothing=0.01,
-            pos_weight=5, gamma=2.0,  ## focal loss
-            amp=False,
-            **_):
+def compile_model(model,
+                  optimizer='LAMB', lr=2e-5, weight_decay=1e-6,
+                  loss_fn='bce', label_smoothing=0.01,
+                  pos_weight=5, gamma=2.0,  ## focal loss
+                  amp=False,
+                  **_):
     """ compile the model with a loss function and an optimizer """
     if loss_fn == 'focal':
         loss = focal_loss(pos_weight=pos_weight, gamma=gamma, label_smoothing=label_smoothing)
@@ -57,22 +57,15 @@ def compile(model,
 
 
 
-def train_model(model, strategy, checkpoint_path,
-                dataset, max_len=192, seed=0,
+def train_model(model, strategy, checkpoint_path, datasets,
                 epochs=30, steps_per_epoch=250,
                 lr=2e-5, one_cycle=True, warm_up=1,
                 mom_min=0.85, mom_max=0.95,
                 div_factor=100, final_div_factor=250,
-                batch_size=28, callback=None,
+                callback=None,
                 **_):
     """ train the given model """
-    batch_size = batch_size * strategy.num_replicas_in_sync
-    print('batch_size:', batch_size)
-
-    if dataset.startswith('gs://'):
-        train_dataset, valid_dataset, test_dataset = tf_dataset(dataset, batch_size, max_len, seed)
-    else:
-        train_dataset, valid_dataset, test_dataset = np_dataset(dataset, batch_size, seed)
+    train_dataset, valid_dataset, test_dataset = datasets
 
     ## Train
     callbacks = [] if callback is None else [callback]
@@ -150,8 +143,9 @@ def setup_tpu(tpu_id):
 ###### MAIN ######
 ##################
 
-def train(gcs='hm-eu-w4', path='jigsaw/test',
-          seed=0, max_len=192, tpu_id=None,
+def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
+          seed=0, max_len=192, batch_size=28,
+          tpu_id=None, dual=False,
           **kwargs):
     """ build and train a TFAutoModel from npz or tfrec dataset """
     params = dict(locals())
@@ -179,12 +173,24 @@ def train(gcs='hm-eu-w4', path='jigsaw/test',
     checkpoint_path = f"{gcs_path}/best_model.tf"
     print('gcs_path:', gcs_path)
     params['gcs_path'] = gcs_path
+    batch_size = batch_size * strategy.num_replicas_in_sync
+    print('batch_size:', batch_size)
+
+    if dual: ## HACK: dynamic import :/
+        from dual_model import build_model, tf_dataset, np_dataset
+    else:
+        from single_model import build_model, tf_dataset, np_dataset
+
+    if dataset.startswith('gs://'):
+        datasets = tf_dataset(dataset, batch_size, max_len, seed)
+    else:
+        datasets = np_dataset(dataset, batch_size, seed)
 
     ## Load and Train
     with strategy.scope():
         model = build_model(**kw_params)
-        model = compile(model, **kw_params)
-    model, preds, sub_y = train_model(model, strategy, checkpoint_path, **kw_params)
+        model = compile_model(model, **kw_params)
+    model, preds, sub_y = train_model(model, strategy, checkpoint_path, datasets, **kw_params)
 
     ## Save results
     plot_history(model.history, path, gcs)
