@@ -1,30 +1,13 @@
-""" build and train a TFAutoModel from npz or tfrec dataset """
-
-import os
-import gc
-import time
+""" build a TFAutoModel and load its data from npz or tfrec dataset """
 import random
-
-import logging
 import numpy as np
 import pandas as pd
-# from tqdm.notebook import tqdm
-from sklearn.metrics import roc_auc_score
-
-import tensorflow_addons as tfa
-# from tensorflow_addons.optimizers.utils import fit_bn
 
 import tensorflow as tf
-from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.models import Model
 
 from transformers import TFAutoModel
-
-from one_cycle_scheduler import OneCycleScheduler
-from focal_loss import focal_loss
-
-logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
 
 def build_model(model_id='jplu/tf-xlm-roberta-large',

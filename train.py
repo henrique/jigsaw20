@@ -17,7 +17,7 @@ import tensorflow_addons as tfa
 import tensorflow as tf
 
 from one_cycle_scheduler import OneCycleScheduler
-from single_model import *
+from single_model import build_model, tf_dataset, np_dataset
 from visual import save_fig, plot_history
 
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
