@@ -9,8 +9,6 @@ from tensorflow.keras.models import Model
 
 from transformers import TFAutoModel
 
-from GeM import Generalized_mean_pooling1D
-
 
 def build_model(model_id='jplu/tf-xlm-roberta-large',
                 max_len=192, dropout=0.2, pooling='first',
@@ -28,11 +26,10 @@ def build_model(model_id='jplu/tf-xlm-roberta-large',
     elif pooling == 'avg':
         cls_token = GlobalAveragePooling1D()(sequence_output)
     elif pooling == 'GeM':
-        cls_token = Generalized_mean_pooling1D(p=3)(sequence_output)
+        cls_token = GeM(p=3)(sequence_output)
 
     if dropout > 0:
         cls_token = Dropout(dropout)(cls_token)
-
     out = Dense(1, activation='sigmoid')(cls_token)
     model = Model(inputs=input_word_ids, outputs=out)
 
