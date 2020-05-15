@@ -91,7 +91,7 @@ def train_model(model, strategy, checkpoint_path, datasets,
                                                         save_weights_only=True))
     print(callbacks)
 
-    model.fit(
+    history = model.fit(
         train_dataset,
         steps_per_epoch=steps_per_epoch,
         validation_data=valid_dataset,
@@ -105,7 +105,7 @@ def train_model(model, strategy, checkpoint_path, datasets,
         with strategy.scope():
             model.load_weights(checkpoint_path)
 
-    return (model,
+    return (model, history,
             model.predict(valid_dataset, verbose=1),
             model.predict(test_dataset, verbose=1))
 
@@ -190,11 +190,11 @@ def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
     with strategy.scope():
         model = build_model(**kw_params)
         model = compile_model(model, **kw_params)
-    model, preds, sub_y = train_model(model, strategy, checkpoint_path, datasets, **kw_params)
+    model, history, preds, sub_y = train_model(model, strategy, checkpoint_path, datasets, **kw_params)
 
     ## Save results
-    plot_history(model.history, path, gcs)
-    history = pd.DataFrame(model.history.history)
+    plot_history(history, path, gcs)
+    history = pd.DataFrame(history.history)
     print(history)
     history.to_csv(f'{gcs_path}/history.csv', index=False)
 
