@@ -172,10 +172,11 @@ def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
     path = f'{path}/{time.strftime("%Y%m%d_%H%M%S")}_{tpu_id}'
     if gcs:
         gcs_path = f'gs://{gcs}/{path}'
+        checkpoint_path = f"{gcs_path}/best_model.tf"
     else:
         os.makedirs(path)
         gcs_path = path
-    checkpoint_path = f"{gcs_path}/best_model.tf"
+        checkpoint_path = f"{path}/best_model.h5"
     print('gcs_path:', gcs_path)
     params['gcs_path'] = gcs_path
     batch_size = batch_size * strategy.num_replicas_in_sync
