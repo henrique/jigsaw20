@@ -170,7 +170,11 @@ def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
 
     ## Configuration
     path = f'{path}/{time.strftime("%Y%m%d_%H%M%S")}_{tpu_id}'
-    gcs_path = f'gs://{gcs}/{path}'
+    if gcs:
+        gcs_path = f'gs://{gcs}/{path}'
+    else:
+        os.makedirs(path)
+        gcs_path = path
     checkpoint_path = f"{gcs_path}/best_model.tf"
     print('gcs_path:', gcs_path)
     params['gcs_path'] = gcs_path

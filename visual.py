@@ -6,11 +6,12 @@ def save_fig(filename, path, gcs):
     """ save current plt fig to gcs """
     plt.gcf().savefig(filename)
     plt.close()
-    # init GCS client and upload file
-    client = storage.Client()
-    bucket = client.get_bucket(gcs)
-    blob = bucket.blob(f'{path}/{filename}')
-    blob.upload_from_filename(filename=filename)
+    if gcs:
+        # init GCS client and upload file
+        client = storage.Client()
+        bucket = client.get_bucket(gcs)
+        blob = bucket.blob(f'{path}/{filename}')
+        blob.upload_from_filename(filename=filename)
 
 
 def plot_history(history, path, bucket):
