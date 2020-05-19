@@ -8,13 +8,14 @@ import logging
 import numpy as np
 import pandas as pd
 # from tqdm.notebook import tqdm
-from matplotlib import pyplot as plt
-from sklearn.metrics import roc_auc_score
 
 import tensorflow_addons as tfa
 # from tensorflow_addons.optimizers.utils import fit_bn
 
 import tensorflow as tf
+
+from matplotlib import pyplot as plt
+from sklearn.metrics import roc_auc_score
 
 from one_cycle_scheduler import OneCycleScheduler
 from visual import save_fig, plot_history
@@ -113,10 +114,10 @@ def train_model(model, strategy, checkpoint_path, datasets,
 
 def setup_tpu(tpu_id):
     """ resolve a tpu cluster """
-    if tpu_id is None:
-        with open('tpu', 'r') as content_file:
-            tpu_id = content_file.read()
-            print(dict(tpu_id=tpu_id))
+    # if tpu_id is None:
+    #     with open('tpu', 'r') as content_file:
+    #         tpu_id = content_file.read()
+    #         print(dict(tpu_id=tpu_id))
 
     ## Detect hardware, return appropriate distribution strategy
     try:
@@ -190,7 +191,8 @@ def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
     with strategy.scope():
         model = build_model(**kw_params)
         model = compile_model(model, **kw_params)
-    model, history, preds, sub_y = train_model(model, strategy, checkpoint_path, datasets, **kw_params)
+    model, history, preds, sub_y = train_model(model, strategy, checkpoint_path, datasets,
+                                               **kw_params)
 
     ## Save results
     plot_history(history, path, gcs)
