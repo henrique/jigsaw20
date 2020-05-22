@@ -29,10 +29,11 @@ class GeneralizedMeanPooling1D(tf.keras.layers.Layer):
 
 
 class GeneralizedMeanPooling2D(tf.keras.layers.Layer):
-    def __init__(self, p=3, epsilon=1e-6, name='', **kwargs):
+    def __init__(self, p=3, epsilon=1e-6, shape=1, **kwargs):
         super().__init__(name, **kwargs)
         self.init_p = p
         self.epsilon = epsilon
+        self.shape = shape
 
     def build(self, input_shape):
         if isinstance(input_shape, list) or len(input_shape) != 4:
@@ -40,7 +41,7 @@ class GeneralizedMeanPooling2D(tf.keras.layers.Layer):
         self.build_shape = input_shape
         self.p = self.add_weight(
               name='p',
-              shape=[1,],
+              shape=[self.shape,],
               initializer=tf.keras.initializers.Constant(value=self.init_p),
               regularizer=None,
               trainable=True,

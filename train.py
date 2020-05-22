@@ -154,8 +154,10 @@ def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
     params = pd.DataFrame(params, index=[0])
     del params['kwargs']
     if params.loc[0, 'loss_fn'] != 'focal':
-        del params['gamma']
-        del params['pos_weight']
+        if 'gamma' in params:
+            del params['gamma']
+        if 'pos_weight' in params:
+            del params['pos_weight']
     kw_params = params.T[0].to_dict()
     print(params.T)
     gc.collect()
