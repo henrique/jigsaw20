@@ -2,6 +2,7 @@
 import os
 import gc
 import time
+import copy
 import random
 
 import logging
@@ -37,9 +38,11 @@ def compile_model(model,
         loss = tf.keras.losses.BinaryCrossentropy(label_smoothing=label_smoothing)
 
     if optimizer == 'LAMB':
-        opt = tfa.optimizers.LAMB(lr=lr, weight_decay_rate=weight_decay)
+        opt = tfa.optimizers.LAMB(learning_rate=lr, weight_decay_rate=weight_decay)
     elif optimizer == 'AdamW':
-        opt = tfa.optimizers.AdamW(lr=lr, weight_decay=weight_decay)
+        opt = tfa.optimizers.AdamW(learning_rate=lr, weight_decay=weight_decay)
+    elif optimizer == 'Yogi':
+        opt = tfa.optimizers.Yogi(learning_rate=lr, l2_regularization_strength=weight_decay)
     print(opt)
 
     if amp:
@@ -146,7 +149,7 @@ def setup_tpu(tpu_id):
 
 def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
           seed=0, max_len=192, batch_size=28,
-          tpu_id=None, dual=False,
+          tpu_id=None, dual=False, pretrained=None,
           **kwargs):
     """ build and train a TFAutoModel from npz or tfrec dataset """
     params = dict(locals())
@@ -196,7 +199,14 @@ def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
 
     ## Load and Train
     with strategy.scope():
-        model = build_model(**kw_params)
+        if pretrained is None:
+            model = build_model(**kw_params)
+        else:
+            model0 = build_model(**kw_params)
+            model0.load_weights(pretrained)
+            model = build_model(transformer=copy.copy(model0.layers[1]), **kw_params)
+            del model0
+
         model = compile_model(model, **kw_params)
     model, history, preds, sub_y = train_model(model, strategy, checkpoint_path, datasets,
                                                **kw_params)
