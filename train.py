@@ -56,6 +56,7 @@ def compile_model(model,
         loss=loss,
         metrics=[tf.keras.metrics.AUC(name='auc')]
     )
+    model.summary()
 
     return model
 
@@ -208,7 +209,7 @@ def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
             del model0
 
         if freeze_embed:
-            model.layers[1].embeddings.trainable = False
+            model.layers[1].layers[0].embeddings.trainable = False
 
         model = compile_model(model, **kw_params)
     model, history, preds, sub_y = train_model(model, strategy, checkpoint_path, datasets,

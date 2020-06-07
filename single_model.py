@@ -36,7 +36,6 @@ def build_model(model_id='jplu/tf-xlm-roberta-large', from_pt=False, transformer
 
     out = Dense(1, activation='sigmoid')(cls_token)
     model = Model(inputs=input_word_ids, outputs=out)
-    print(model.summary())
 
     return model
 
