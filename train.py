@@ -29,7 +29,7 @@ def compile_model(model,
                   optimizer='LAMB', lr=2e-5, weight_decay=1e-6,
                   loss_fn='bce', label_smoothing=0.01,
                   pos_weight=5, gamma=2.0,  ## focal loss
-                  amp=False,
+                  amp=False, lookahead=0,
                   **_):
     """ compile the model with a loss function and an optimizer """
     if loss_fn == 'focal':
@@ -41,15 +41,23 @@ def compile_model(model,
         opt = tfa.optimizers.LAMB(learning_rate=lr, weight_decay_rate=weight_decay)
     elif optimizer == 'AdamW':
         opt = tfa.optimizers.AdamW(learning_rate=lr, weight_decay=weight_decay)
+    elif optimizer == 'NovoGrad':
+        opt = tfa.optimizers.NovoGrad(learning_rate=lr, weight_decay=weight_decay)
+    elif optimizer == 'RAdam':
+        opt = tfa.optimizers.RectifiedAdam(learning_rate=lr, weight_decay=weight_decay)
     elif optimizer == 'Yogi':
         opt = tfa.optimizers.Yogi(learning_rate=lr, l2_regularization_strength=weight_decay)
-    print(opt)
 
     if amp:
         print('Using auto_mixed_precision.')
         tf.config.optimizer.set_jit(True)
         tf.config.optimizer.set_experimental_options({"auto_mixed_precision": True})
         opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, 'dynamic')
+
+    if lookahead > 0:
+        opt = tfa.optimizers.Lookahead(opt, sync_period=lookahead, slow_step_size=0.5)
+
+    print(opt)
 
     model.compile(
         optimizer=opt,
