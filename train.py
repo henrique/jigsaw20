@@ -148,7 +148,7 @@ def setup_tpu(tpu_id):
 ##################
 
 def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
-          seed=0, max_len=192, batch_size=28,
+          seed=0, max_len=192, batch_size=28, freeze_embed=False,
           tpu_id=None, dual=False, pretrained=None,
           **kwargs):
     """ build and train a TFAutoModel from npz or tfrec dataset """
@@ -206,6 +206,9 @@ def train(dataset, gcs='hm-eu-w4', path='jigsaw/test',
             model0.load_weights(pretrained)
             model = build_model(transformer=copy.copy(model0.layers[1]), **kw_params)
             del model0
+
+        if freeze_embed:
+            model.layers[1].embeddings.trainable = False
 
         model = compile_model(model, **kw_params)
     model, history, preds, sub_y = train_model(model, strategy, checkpoint_path, datasets,
