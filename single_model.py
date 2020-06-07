@@ -12,12 +12,12 @@ from transformers import TFAutoModel
 from GeM import GeneralizedMeanPooling1D
 
 
-def build_model(model_id='jplu/tf-xlm-roberta-large', transformer=None,
+def build_model(model_id='jplu/tf-xlm-roberta-large', from_pt=False, transformer=None,
                 max_len=192, dropout=0.2, pooling='first',
                 **_):
     """ build a TFAutoModel """
     if transformer is None:
-        transformer = TFAutoModel.from_pretrained(model_id)
+        transformer = TFAutoModel.from_pretrained(model_id, from_pt=from_pt)
 
     input_word_ids = Input(shape=(max_len,), dtype=tf.int32, name="input_word_ids")
     sequence_output = transformer(input_word_ids)[0]
